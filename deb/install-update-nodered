@@ -1,0 +1,779 @@
+#!/bin/bash
+#
+# Node-RED Installer for Debian based systems
+#
+# Copyright 2016,2026 JS Foundation and other contributors, https://js.foundation/
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+NODE_VERSION=24
+tgta22=22.22.2   # armv6l latest from https://unofficial-builds.nodejs.org/download/release/
+# Extra nodes installed on Raspberry Pi only (see Pi-specific section below)
+EXTRANODES="node-red-node-pi-gpio@latest node-red-node-random@latest node-red-node-ping@latest node-red-contrib-play-audio@latest node-red-node-smooth@latest node-red-node-serialport@latest node-red-contrib-buffer-parser@latest"
+ARMV6="n"
+
+if [ ! -f /etc/debian_version ] || [ "$(uname)" == "Darwin" ]; then
+    echo " "
+    echo "************************************************************"
+    echo "                                                            "
+    echo "  Apologies...                                              "
+    echo "  This installer is only for Debian based Linux systems.    "
+    echo "  Please see the documentation at                           "
+    echo "     http://nodered.org/docs/getting-started/upgrading      "
+    echo "                                                            "
+    echo -e "************************************************************\n"
+    exit 1
+elif [[ "$(uname -m)" =~ "i686" ]] || [[ "$(uname -m)" =~ "x86_64" && "$(getconf LONG_BIT)" =~ "32" ]]; then
+    echo " "
+    echo "************************************************************"
+    echo "                                                            "
+    echo "  STOP !                                                    "
+    echo "  There are no known Node.js v24 builds for 32 bit systems. "
+    echo "                                                            "
+    echo -e "************************************************************\n"
+    exit 1
+elif uname -m | grep -q armv6l ; then
+    echo " "
+    echo "************************************************************"
+    echo "                                                            "
+    echo "  Warning :                                                 "
+    echo "     There are  no v24 or later builds for Arm v6 systems.   "
+    echo "     Using Node.js v22 instead.                             "
+    echo "     Node.js v22 goes EOL in April 2027.                    "
+    echo "                                                            "
+    echo "************************************************************"
+    sleep 6
+    NODE_VERSION=22
+    ARMV6="y"
+fi
+
+umask 0022
+
+usage() {
+  cat << EOL
+Usage: $0 [options]
+
+Options:
+  --help            display this help and exit
+  --confirm-root    install as root without asking confirmation
+  --confirm-install confirm installation without asking confirmation
+  --allow-low-ports add capability to bind to ports below 1024 (default is disallow)
+  --update-nodes    run npm update on existing installed nodes (within scope of package.json)
+  --no-init         don't ask to initialise settings if they don't exist
+  --on-diet         bypass DietPi exit and force install Node-RED on DietPi
+  --nodered-user    specify the user to run as, useful for installing as sudo - e.g. --nodered-user=pi
+  --nodered-version if not set, the latest version is used - e.g. --nodered-version="5.0.0"
+  --node22          if set, forces install of latest major version of nodejs 22 LTS
+  --node24          if set, forces install of latest major version of nodejs 24 LTS
+                    if none set, install nodejs 24 LTS if no nodejs is installed
+                    otherwise leave current nodejs install
+
+Note: if you use allow-low-ports it may affect the node modules paths - see https://stackoverflow.com/a/65560687
+EOL
+}
+
+SUDO=sudo
+SUDOE="sudo -E"
+LOW_PORTS="n"
+if [ $# -gt 0 ]; then
+  # Parsing parameters
+  while (( "$#" )); do
+    case "$1" in
+      --help)
+        usage && exit 0
+        shift
+        ;;
+      --confirm-root)
+        CONFIRM_ROOT="y"
+        shift
+        ;;
+      --confirm-install)
+        CONFIRM_INSTALL="y"
+        shift
+        ;;
+      --update-nodes)
+        UPDATENODES="y"
+        shift
+        ;;
+      --nodered-version=*)
+        NODERED_VERSION="${1#*=}"
+        shift
+        ;;
+      --nodered-user=*)
+        NODERED_USER="${1#*=}"
+        shift
+        ;;
+      --node22)
+        NODE_VERSION="22"
+        FORCE_NODE="y"
+        shift
+        ;;
+      --node24)
+        NODE_VERSION="24"
+        FORCE_NODE="y"
+        shift
+        ;;
+      --node26)
+        NODE_VERSION="26"
+        FORCE_NODE="y"
+        shift
+        ;;
+      --allow-low-ports)
+        LOW_PORTS="y"
+        shift
+        ;;
+      --no-init)
+        INITSET="n"
+        shift
+        ;;
+      --on-diet)
+        ONDIET="y"
+        shift
+        ;;
+      --) # end argument parsing
+        shift
+        break
+        ;;
+      -*|--*=) # unsupported flags
+        echo "Error: Unsupported flag $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [[ "$ARMV6" == "y" ]] && [ "$NODE_VERSION" -gt 22 ]; then
+    echo "Armv6l platform detected. Option --node$NODE_VERSION is not supported. Exiting."
+    echo " "
+    exit 1
+  fi
+fi
+
+# helper function to test for existance of node and npm
+function HAS_NODE {
+    if [ -x "$(command -v node)" ]; then return 0; else return 1; fi
+}
+function HAS_NPM {
+    if [ -x "$(command -v npm)" ]; then return 0; else return 1; fi
+}
+
+# check for apt and systemctl (set flags for later use and log if not found)
+if [ -x "$(command -v apt)" ]; then
+    APTOK=true;
+else
+    APTOK=false
+    echo "apt not found. Node/Npm install will be skipped" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+fi
+
+if [ -x "$(command -v systemctl)" ]; then
+    SYSTEMDOK=true;
+else
+    SYSTEMDOK=false
+    echo "systemctl not found. shortcuts/services setup will be skipped" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+fi
+
+echo -ne "\033[2 q"
+if [[ -e /mnt/dietpi_userdata && "$ONDIET" != "y" ]]; then
+    echo -ne "\n\033[1;32mDietPi\033[0m detected - only going to add the  \033[0;36mnode-red-start, -stop, -log\033[0m  commands.\n"
+    echo -ne "Flow files and other things worth backing up can be found in the \033[0;36m/mnt/dietpi_userdata/node-red\033[0m directory.\n\n"
+    echo -ne "Use the  \033[0;36mdietpi-software\033[0m  command to un-install and re-install \033[38;5;88mNode-RED\033[0m.\n\n"
+    echo -ne "If you want to force install Node-RED, re-run this script with the \033[0;36m--on-diet\033[0m option.\n\n"
+    echo "journalctl -f -n 100 -u node-red -o cat" > /usr/bin/node-red-log
+    chmod +x /usr/bin/node-red-log
+    echo "systemctl stop node-red" > /usr/bin/node-red-stop
+    chmod +x /usr/bin/node-red-stop
+    echo "systemctl start node-red" > /usr/bin/node-red-start
+    echo "journalctl -f -n 0 -u node-red -o cat" >> /usr/bin/node-red-start
+    chmod +x /usr/bin/node-red-start
+    exit 0
+fi
+
+if [[ -e /mnt/dietpi_userdata && "$ONDIET" == "y" ]]; then
+    DIETPI="y"
+    echo -ne "\n\033[1;32mDietPi\033[0m detected but going to force install of Node-RED.\n"
+    echo -ne "\nThis should only be done if you DO NOT use the dietpi-software\ninstaller to set up Node.js and Node-RED.\n"
+    echo -ne "\nTrying to mix both will possibly break something - Use at your own risk.\n\n"
+    read -t 10 -p "Are you really sure you want to force install on DietPi ? (y/N) ? " yn
+    case $yn in
+        [Yy]* )
+        ;;
+        * )
+        echo " "
+        exit 1
+        ;;
+    esac
+    echo -ne "\nOK - fingers crossed.\n\n"
+    apt install -y python3-rpi.gpio 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+    CONFIRM_ROOT="y"
+    CONFIRM_INSTALL="y"
+fi
+
+if [ "$EUID" == "0" ]; then
+    echo -en "\nroot user detected. Typical installs should be done as a regular user.\r\n"
+    echo -en "If you are running this script using sudo, please cancel and rerun without sudo.\r\n"
+    echo -en "--nodered-user can be used to specify the user otherwise installation will happen under /root.\r\n"
+    echo -en "If you know what you are doing as root, please continue.\r\n\r\n"
+
+    yn="${CONFIRM_ROOT}"
+    [ ! "${yn}" ] && read -t 10 -p "Are you really sure you want to install as root ? (y/N) ? " yn
+    case $yn in
+        [Yy]* )
+        NODERED_USER="root"
+        ;;
+        * )
+        echo " "
+        exit 1
+        ;;
+    esac
+    SUDO=''
+    SUDOE=''
+    id -u nobody &>/dev/null || adduser --no-create-home --shell /dev/null --disabled-password --disabled-login --gecos '' nobody &>/dev/null
+else
+    groups "$USER" | grep -q '\bsudo\b' && GRS="Y" || GRS="N"
+    if [[ "$GRS" == "N" ]]; then
+        echo "User $USER not in sudoers group. Exiting"
+        exit 1;
+    fi
+fi
+
+# setup user, home and group
+if [[ "$NODERED_USER" == "" ]]; then
+    NODERED_HOME=$HOME
+    NODERED_USER=$USER
+    NODERED_GROUP=$(id -gn)
+else
+    NODERED_GROUP="$NODERED_USER"
+    NODERED_HOME="/home/$NODERED_USER"
+    if [[ "$NODERED_USER" == "root" ]]; then
+        NODERED_HOME="/root"
+    fi
+fi
+SUDOU="sudo -u $NODERED_USER"
+
+if curl -I https://registry.npmjs.org/@node-red/util  >/dev/null 2>&1; then
+
+    echo " "
+    echo Node-RED update script for : $NODERED_USER@$(hostname)
+    echo " "
+    echo "This script checks if Node.js is installed, and will try to install"
+    echo "Node.js $NODE_VERSION if it is not found."
+    echo " "
+    echo "It will then remove the old core of Node-RED, before then installing the latest"
+    echo "version. You can also optionally specify the version required."
+    echo " "
+    echo "To do all this it runs commands as root - please satisfy yourself that this will"
+    echo "not damage your Pi, or otherwise compromise your configuration."
+    echo " "
+    echo "If in doubt please backup your SD card first."
+    echo " "
+    echo "See the optional parameters by re-running this command with --help"
+    echo " "
+    if [[ -e "$NODERED_HOME/.nvm" ]]; then
+        echo -ne '\033[1mNOTE:\033[0m We notice you are using \033[38;5;88mnvm\033[0m.\n'
+        echo -ne 'Please ensure it is running the current LTS version.\n'
+        echo -ne 'Using nvm is NOT RECOMMENDED. Node-RED will not run as a service under nvm.\r\n\n'
+        sleep 7
+    elif [[ $(which n) ]]; then
+        echo -ne '\033[1mNOTE:\033[0m We notice you are using \033[38;5;88mn\033[0m.\n'
+        echo -ne 'Please ensure it is running the current LTS version.\n'
+        echo -ne 'Using n is NOT RECOMMENDED.\r\n\n'
+        sleep 7
+    fi
+
+    yn="${CONFIRM_INSTALL}"
+    [ ! "${yn}" ] && read -t 30 -p "Are you really sure you want to do this ? [y/N] ? " yn
+    case $yn in
+        [Yy]* )
+            echo ""
+            # this script assumes that $HOME is the folder of the user that runs node-red
+            # that $NODERED_USER is the user name and the group name to use when running is the
+            # primary group of that user
+            # if this is not correct then edit the lines below
+            MYOS=$(grep "^ID=" /etc/os-release | cut -d = -f 2 | tr -d '"')
+            GLOBAL="true"
+            TICK='\033[1;32m\u2714\033[0m'
+            CROSS='\033[1;31m\u2718\033[0m'
+            cd "$NODERED_HOME" || exit 1
+            clear
+            echo -e "\nRunning \033[38;5;88mNode-RED\033[0m install for user $NODERED_USER at $NODERED_HOME on $MYOS\n"
+
+            time1=$(date)
+            if [[ "$FORCE_NODE" == "y" ]]; then
+                echo "  Removing any existing Node.js and npm... "
+                echo "Force node install option selected - will try to remove existing nodejs and npm first" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                $SUDO apt purge nodejs npm 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                $SUDO rm -rf /usr/local/bin/node* /usr/local/lib/node_modules/npm* /usr/bin/node* /usr/lib/node_modules/npm* 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            fi
+
+            NUPG=""
+            if HAS_NODE && HAS_NPM; then
+                nv2=$(node -v 2>/dev/null)
+                np2=$(npm -v 2>/dev/null)
+
+                echo "Node.js $nv2 and Npm $np2 already installed" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                echo "  Node.js $nv2 and Npm $np2 already installed."
+                if [[ "$ARMV6" == "y" ]]; then
+                    echo "  There are no v24 or later builds for Arm v6 systems   "
+                    echo "   -- Node.js v22 goes End Of Life in April 2027 --     "
+                fi
+
+               # Check for nvm or n usage.
+                if [[ -d "$NODERED_HOME/.nvm" ]]; then
+                    GLOBAL="false"
+                    echo -ne '  Using NVM to manage Node.js         +   please run   \033[0;36mnvm use lts\033[0m   before running Node-RED\r\n'
+                    echo -ne '  NOTE: Using nvm is NOT RECOMMENDED.     Node-RED will NOT run as a service under nvm.\r\n'
+                    export NVM_DIR="$NODERED_HOME/.nvm"
+                    [ -s "$NVM_DIR/nvm.sh" ] && \."$NVM_DIR/nvm.sh"  # This loads nvm
+                    echo "Using NVM !!! $(nvm current)" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    nvm install $NODE_VERSION --no-progress --latest-npm >/dev/null 2>&1
+                    nvm use $NODE_VERSION >/dev/null 2>&1
+                    nvm alias default $NODE_VERSION >/dev/null 2>&1
+                    echo "Now using --- $(nvm current)" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    ln -f -s "$NODERED_HOME/.nvm/versions/node/$(nvm current)/lib/node_modules/node-red/red.js" "$NODERED_HOME/node-red"
+                    echo -ne "  Update Node.js $NODE_VERSION                   $CHAR - Using nvm is NOT recommended/supported."
+                elif [[ $(which n) ]]; then
+                    echo "Using n" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    echo -ne "  Using N to manage Node.js           + $nv2\r\n"
+                    # echo -ne '  NOTE: Using n is NOT RECOMMENDED. Attempting to set version to '$NODE_VERSION'.\r\n'
+                    # $SUDO n $NODE_VERSION 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    # if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                    # echo -ne "  Update Node.js $NODE_VERSION                   $CHAR - Using n is NOT recommended/supported.\n"
+                fi
+
+            else
+                # Now install nodejs and npm
+                if [[ "$ARMV6" == "y" ]]; then
+                    echo "  Armv6l platform detected - will try to install Node.js $tgta22"
+                    echo -ne "  \033[1mNOTE:\033[0m Node.js v22 goes EOL in April 2027\r\n  This platform will not be supported after that date\r\n\r\n"
+                    echo -ne "  Install Node.js $tgta22 for Armv6l \033[5m_\033[0m"
+                    curl -sSL -o "$NODERED_HOME/node.tgz" https://unofficial-builds.nodejs.org/download/release/v$tgta22/node-v$tgta22-linux-armv6l.tar.gz 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    # unpack it into the correct places
+                    hd=$(head -c 6 "$NODERED_HOME/node.tgz")
+                    if [ "$hd" == "<!DOCT" ] || [ "$hd" == "<html>" ]; then
+                        CHAR="$CROSS File $f not downloaded";
+                    else
+                        if [[ -d /tmp/nodejs ]]; then
+                            $SUDO rm -rf /tmp/nodejs
+                        fi
+                        mkdir -p /tmp/nodejs
+                        $SUDO tar -zxof "$NODERED_HOME/node.tgz" --strip-components=1 -C /tmp/nodejs
+                        $SUDO chown -R 0:0 /tmp/nodejs 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        $SUDO cp -PR /tmp/nodejs/* /usr/ 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                        $SUDO rm -rf /tmp/nodejs 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    fi
+                    # remove the tgz file to save space
+                    rm "$NODERED_HOME/node.tgz" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    nv2=$(node -v)
+                    np2=$(npm -v)
+                    NUPG=$CHAR
+                    echo -ne "\b $CHAR   $nv2 : Npm $np2\r\n"
+                else
+                    if [[ "$APTOK" == "false" ]]; then
+                        if HAS_NODE; then echo -en "\b$CROSS   MISSING: Npm\r\n"; fi
+                        if HAS_NPM; then echo -en "\b$CROSS   MISSING: Node.js\r\n"; fi
+                        echo -en "\b$CROSS   MISSING: apt"
+                        echo -e "\r\n\r\nThis script uses apt to install Node.js and Npm.\n"
+                        echo -e "You can install Node.js and Npm manually then run the script again to continue.\r\n\r\n"
+                        exit 2
+                    fi
+
+                    # Install nodejs for all other platforms
+                    echo "  No Node.js detected - will try to install Node.js $NODE_VERSION"
+                    echo -ne "  Install Node.js \033[5m_\033[0m"
+
+                    # block debian nodejs install
+                    echo "Package: nodejs" | $SUDO tee /etc/apt/preferences.d/nodejs.pref >>/dev/null
+                    echo "Pin: release a=stable" | $SUDO tee -a /etc/apt/preferences.d/nodejs.pref >>/dev/null
+                    echo "Pin-Priority: -1" | $SUDO tee -a /etc/apt/preferences.d/nodejs.pref >>/dev/null
+
+                    # use the official script to install for other debian platforms
+                    $SUDO rm -rf /etc/apt/sources.list.d/nodesource.list 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO apt install -y ca-certificates curl gnupg 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO mkdir -p /etc/apt/keyrings 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | $SUDOE gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_VERSION.x nodistro main" | $SUDOE tee -a /etc/apt/sources.list.d/nodesource.list >>/dev/null
+                    $SUDO apt-get update 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO apt install -y --reinstall nodejs 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+
+                    # echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_VERSION.x nodistro main" | $SUDOE tee -a /etc/apt/sources.list.d/nodesource.list >>/dev/null
+                    # $SUDO apt-get update 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    # $SUDO apt install -y --reinstall nsolid 2>&1 | $SUDO tee -a /var/log/nodered-install.log >> /dev/null
+
+                    if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                    NUPG=$CHAR
+                    if [[ "$CHAR" == "$CROSS" ]]; then
+                        echo -ne "\b\                    $CHAR   Failed to install Node.js $NODE_VERSION\r\n"
+                        echo -ne "  Please try installing Node.js $NODE_VERSION manually and then re-run this script.\r\n"
+                        exit 2
+                    fi
+                    nv2=$(node -v)
+                    np2=$(npm -v)
+                    echo -ne "\b                    $CHAR   $nv2 : Npm $np2\r\n"
+                fi
+
+            fi
+            # OK - now we have node and npm - either existing or new - so we can try to install Node-RED
+
+            # ensure ~/.config dir is owned by the user
+            $SUDO chown -Rf "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.config/"
+
+            # save the existing state of the service so we can restart it at the end if it was running before
+            if [[ "$SYSTEMDOK" == "true" ]]; then
+                if systemctl is-active --quiet nodered; then
+                    WAS_RUNNING="y";
+                else
+                    WAS_RUNNING="n";
+                fi
+            else
+                WAS_RUNNING="n"
+            fi
+
+            # stop any running node-red service
+            if [[ "$WAS_RUNNING" == "y" ]]; then
+                # echo "  Node-RED service is currently running - will try to stop it before updating"
+                $SUDO service nodered stop 2>&1 | $SUDO tee -a /var/log/nodered-install.log >> /dev/null
+                if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                echo -ne "  Stop Node-RED                       $CHAR\r\n"
+            fi
+
+            # remove any old node-red installs or files
+            $SUDO rm -rf /usr/local/lib/node_modules/node-red* /usr/local/bin/node-red* 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            $SUDO rm -rf /usr/lib/node_modules/node-red* /usr/bin/node-red* 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            echo -ne '  Remove old version of Node-RED      \033[1;32m\u2714\033[0m\r\n'
+
+            hash -r
+            if [[ "$GLOBAL" == "true" ]]; then
+                $SUDO npm cache clean --force 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            else
+                npm cache clean --force 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            fi
+            if $SUDO rm -rf "$NODERED_HOME/.node-gyp" "$NODERED_HOME/.npm" /root/.node-gyp /root/.npm; then CHAR=$TICK; else CHAR=$CROSS; fi
+            echo -ne "  Clean npm cache                     $CHAR\r\n"
+
+            # and install Node-RED
+            echo "Now install Node-RED $NODERED_VERSION" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+
+            NODERED_VERSION_SELECTION=""
+            if [ -z ${NODERED_VERSION} ]; then
+                NODERED_VERSION_SELECTION="latest"
+            else
+                NODERED_VERSION_SELECTION=${NODERED_VERSION}
+            fi
+
+            echo -ne "  Install Node-RED core \033[5m_\033[0m "
+            if [[ "$GLOBAL" == "true" ]]; then
+                $SUDO npm i -g --no-progress --no-update-notifier --no-audit --no-fund --loglevel=error node-red@"$NODERED_VERSION_SELECTION" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null; nri=${PIPESTATUS[0]}
+                if [[ $nri -eq 0 ]]; then CHAR=$TICK; else CHAR=$CROSS; fi
+            else
+                npm i -g --no-progress --no-update-notifier --no-audit --no-fund --loglevel=error node-red@"$NODERED_VERSION_SELECTION" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null; nri=${PIPESTATUS[0]}
+                if [[ $nri -eq 0 ]]; then CHAR=$TICK; else CHAR=$CROSS; fi
+            fi
+            nrv=$(npm -g --no-progress --no-update-notifier --no-audit --no-fund --loglevel=error ls node-red | grep node-red | cut -d '@' -f 2 | $SUDO tee -a /var/log/nodered-install.log) >>/dev/null 2>&1
+            echo -ne "\b\b              $CHAR   $nrv\r\n"
+
+            # Setup basic user dir - install some nodes if necesssary.
+            echo "Now create basic package.json for the user" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            mkdir -p "$NODERED_HOME/.node-red/node_modules"
+            $SUDO chown "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.node-red" 2>&1 >>/dev/null
+            $SUDO chown -Rf "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.node-red/node_modules" 2>&1 >>/dev/null
+            pushd "$NODERED_HOME/.node-red" 2>&1 >>/dev/null
+                npm config set update-notifier false 2>&1 >>/dev/null
+                npm config set fund false 2>&1 >>/dev/null
+                if [ ! -f "package.json" ]; then
+                    cat > package.json << EOF
+{
+  "name": "node-red-project",
+  "description": "initially created for you by Node-RED $nrv",
+  "version": "0.0.1",
+  "private": true,
+  "dependencies": {
+  }
+}
+EOF
+                fi
+
+                # try to rebuild any already installed nodes
+                CHAR="-"
+                if [[ "$NUPG" == "$TICK" ]]; then
+                    echo -ne "Running npm rebuild\r\n" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    npm rebuild --no-progress --no-update-notifier --no-fund 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                    echo -ne "  Npm rebuild existing nodes          $CHAR\r"
+                else
+                    echo -ne "  Leave existing nodes                -\r"
+                fi
+                if [[ "$UPDATENODES" == "y" ]]; then
+                    echo -ne "Running npm update\r\n" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    echo -ne "  Npm update existing nodes           "
+                    npm update --no-progress --no-update-notifier --no-fund 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+                    echo -ne "$CHAR\r"
+                fi
+                echo -ne "\n"
+
+                # If armv6 then remove the bcrypt binary to workaround illegal instruction error
+                if uname -m | grep -q armv6l ; then
+                    $SUDO rm -rf /usr/lib/node_modules/node-red/node_modules/@node-rs | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                fi
+
+            popd 2>&1 >>/dev/null
+
+            if [ -d "$NODERED_HOME/.npm" ]; then
+                $SUDO chown -Rf "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.npm" 2>&1 >>/dev/null
+            fi
+
+            if [[ "$SYSTEMDOK" == "true" ]] && [[ "$GLOBAL" == "true" ]]; then
+                # add the shortcut and start/stop/log scripts to the menu
+                echo "Now add the shortcut and start/stop/log scripts to the menu" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                $SUDO mkdir -p /usr/bin
+                if $SUDO curl -m 60 -f https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-icon.svg >/dev/null 2>&1; then
+                    $SUDO curl -sL -m 60 -o /usr/bin/node-red-start https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-start 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /usr/bin/node-red-stop https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-stop 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /usr/bin/node-red-restart https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-restart 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /usr/bin/node-red-reload https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-reload 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /usr/bin/node-red-log https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-log 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /etc/logrotate.d/nodered https://raw.githubusercontent.com/node-red/linux-installers/master/resources/nodered.rotate 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO chmod +x /usr/bin/node-red-start
+                    $SUDO chmod +x /usr/bin/node-red-stop
+                    $SUDO chmod +x /usr/bin/node-red-restart
+                    $SUDO chmod +x /usr/bin/node-red-reload
+                    $SUDO chmod +x /usr/bin/node-red-log
+                    $SUDO curl -sL -m 60 -o /usr/share/icons/hicolor/scalable/apps/node-red-icon.svg https://raw.githubusercontent.com/node-red/linux-installers/master/resources/node-red-icon.svg 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    $SUDO curl -sL -m 60 -o /usr/share/applications/Node-RED.desktop https://raw.githubusercontent.com/node-red/linux-installers/master/resources/Node-RED.desktop 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    echo -ne "  Add shortcut commands               $TICK\r\n"
+                else
+                    echo -ne "  Add shortcut commands               $CROSS\r\n"
+                fi
+
+                # add systemd script and configure it for $NODERED_USER
+                echo "Now add systemd script and configure it for $NODERED_USER:$NODERED_GROUP @ $NODERED_HOME" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+
+                SYSTEMDFILE="/lib/systemd/system/nodered.service"
+
+                $SUDO curl -sfL -m 60 -o "${SYSTEMDFILE}.temp" https://raw.githubusercontent.com/node-red/linux-installers/master/resources/nodered.service 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                if [ ${PIPESTATUS[0]} -eq 0 ]; then CHAR=$TICK; else CHAR=$CROSS; fi
+
+                # set memory limit based on total RAM: <894MB->256, <1894MB->512, <3894MB->1024, <7894MB->2048, else->4096
+                TOTAL_MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+                if   [ "$TOTAL_MEM_KB" -lt 894000  ]; then mem="256"
+                elif [ "$TOTAL_MEM_KB" -lt 1894000 ]; then mem="512"
+                elif [ "$TOTAL_MEM_KB" -lt 3894000 ]; then mem="1024"
+                elif [ "$TOTAL_MEM_KB" -lt 7894000 ]; then mem="2048"
+                else mem="4096"
+                fi
+
+                $SUDO sed -i 's#=512#='$mem'#;' "${SYSTEMDFILE}.temp"
+                $SUDO sed -i 's#^User=.*#User='$NODERED_USER'#;s#^Group=.*#Group='$NODERED_GROUP'#;s#^WorkingDirectory=.*#WorkingDirectory='$NODERED_HOME'#;s#^EnvironmentFile=-.*#EnvironmentFile=-'$NODERED_HOME'/.node-red/environment#;' "${SYSTEMDFILE}.temp"
+
+                grep -sq XDG_RUNTIME_DIR "$NODERED_HOME/.node-red/environment" || echo XDG_RUNTIME_DIR=/run/user/$UID >> "$NODERED_HOME/.node-red/environment"
+
+                if test -f "$SYSTEMDFILE"; then
+                    # there's already a systemd script - compare checksums to detect customisation
+                    EXISTING_FILE=$(md5sum "$SYSTEMDFILE" | cut -d ' ' -f 1)
+                    TEMP_FILE=$(md5sum "${SYSTEMDFILE}.temp" | cut -d ' ' -f 1)
+
+                    if [[ "$EXISTING_FILE" == "$TEMP_FILE" ]]; then
+                        : # silent procedure - files are identical
+                    else
+                        echo "Customized systemd script found @ $SYSTEMDFILE. To prevent loss of modifications, we will not recreate the systemd script." | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        echo "If you want the installer to recreate the systemd script, please delete or rename the current script & re-run the installer." | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        CHAR="-   Skipped - existing script is customized."
+                    fi
+                    $SUDO rm "${SYSTEMDFILE}.temp"
+                else
+                    $SUDO mv "${SYSTEMDFILE}.temp" "$SYSTEMDFILE"
+                fi
+
+                $SUDO systemctl daemon-reload 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                echo -ne "  Update systemd script               $CHAR\r\n"
+            else
+                echo -ne "  Add shortcut commands               :   Skipped - systemd not found\r\n"
+                echo -ne "  Update systemd script               :   Skipped - systemd not found\r\n"
+            fi
+            $SUDO ln -s "$(which python3)" /usr/bin/python 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+
+            CHAR=$TICK
+            # remove unneeded large sentiment library to save space and load time
+            $SUDO rm -f /usr/lib/node_modules/node-red/node_modules/multilang-sentiment/build/output/build-all.json 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            # on LXDE add launcher to top bar, refresh desktop menu
+            pfile="/home/$NODERED_USER/.config/lxpanel/LXDE-pi/panels/panel"
+            if [ -e "$pfile" ]; then
+                if ! grep -q "Node-RED" "$pfile"; then
+                    mat="lxterminal.desktop"
+                    ins="lxterminal.desktop\n    }\n    Button {\n      id=Node-RED.desktop"
+                    $SUDO sed -i "s|$mat|$ins|" "$pfile" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    if xhost >& /dev/null ; then
+                        export DISPLAY=:0 && lxpanelctl restart 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    fi
+                fi
+                echo -ne "  Add launcher to top bar               $CHAR\r\n"
+            fi
+
+            # on Pi, add launcher to top bar, add cpu temp example, make sure ping works
+            echo "Now add launcher to top bar, add cpu temp example, make sure ping works" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            if $SUDO grep -q Raspberry /proc/cpuinfo; then
+                $SUDO adduser "$NODERED_USER" gpio 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                FAM=$(cut -d ' ' -f 1 /etc/issue)  # FIX: removed useless cat pipe
+                ISS=$(cut -d '/' -f 2 /etc/issue | cut -d ' ' -f 2)  # FIX: removed useless cat pipe
+                if [[ "$FAM" == *"bian" ]]; then
+                    if [ "$ISS" -gt 11 ] && [ "$DIETPI" != "y" ]; then
+                        echo "Replace old rpi.gpio with lgpio" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        $SUDO apt purge -y python3-rpi.gpio 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        $SUDO apt install -y python3-rpi-lgpio 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        echo "Installing extra Pi nodes: $EXTRANODES :" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        echo -ne "  Installing Extra Pi nodes "
+                        npm i --save --no-progress --no-update-notifier --no-audit --no-fund $EXTRANODES 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        echo -ne "          $CHAR\r\n"
+                    else
+                        echo "Leaving old rpi.gpio" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                        $SUDO apt install -y python3-rpi.gpio 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    fi
+                fi
+                echo -ne "  Fixup Pi tweaks                     $CHAR\r\n"
+            fi
+            $SUDO setcap cap_net_raw=ep /bin/ping 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+
+            echo "Allow binding to low ports : $LOW_PORTS" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+            if [[ "$LOW_PORTS" == "y" ]] ; then
+                $SUDO setcap cap_net_bind_service=+ep "$(eval readlink -f "$(which node)")" 2>&1 | $SUDO tee -a /var/log/nodered-install.log >>/dev/null  # FIX: quoted subshell
+            fi
+
+            echo -ne "  All done.\r\n\r\n"
+            if [[ "$WAS_RUNNING" == "y" ]]; then
+                echo -ne "\033[1mRestarting \033[38;5;88mNode-RED\033[0m service\r\n"
+                $SUDO systemctl restart nodered
+                echo -ne "\033[1mRestarted  \033[38;5;88mNode-RED\033[0m\r\n"
+                echo "Started :  $time1 " | $SUDO tee -a /var/log/nodered-install.log
+                echo "Finished:  $(date)" | $SUDO tee -a /var/log/nodered-install.log
+                echo " "
+            else
+                if [[ "$GLOBAL" == "true" ]] ; then
+                    if [[ "$SYSTEMDOK" == "true" ]]; then
+                        echo -ne "You can now start Node-RED with the command  \033[0;36mnode-red-start\033[0m\r\n"
+                        echo -ne "  or using the icon under   Menu / Programming / Node-RED\r\n"
+                    else
+                        echo -ne "You can now start Node-RED with the command  \033[0;36mnode-red\033[0m\r\n"
+                    fi
+                else
+                    echo -ne "You can now start Node-RED with the command  \033[0;36m./node-red\033[0m\r\n"
+                fi
+
+                echo -ne "Then point your browser to \033[0;36mlocalhost:1880\033[0m or \033[0;36mhttp://{your_pi_ip-address}:1880\033[0m\r\n"
+                echo -ne "\r\n"
+                if free -h -t >/dev/null 2>&1; then
+                    echo "Memory  : $(free -h -t | grep Total | awk '{print $2}' | cut -d i -f 1)" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                else
+                    echo "Mem     : $(free -m | grep Mem | awk '{print $2}' | cut -d i -f 1)Mb" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                    echo "Swap    : $(free -m | grep Swap | awk '{print $2}' | cut -d i -f 1)Mb" | $SUDO tee -a /var/log/nodered-install.log >>/dev/null
+                fi
+                echo "Started :  $time1 " | $SUDO tee -a /var/log/nodered-install.log
+                echo "Finished:  $(date)" | $SUDO tee -a /var/log/nodered-install.log
+
+                file="/home/$NODERED_USER/.node-red/settings.js"
+                if [[ "$NODERED_USER" == "root" ]]; then
+                    file=/root/.node-red/settings.js
+                fi
+                if [ ! -f "$file" ]; then
+                    echo " "
+                elif ! diff -q -w --suppress-common-lines /usr/lib/node_modules/node-red/settings.js "$file" &>/dev/null 2>&1 ; then
+                    CURL_OUTPUT=$($SUDO curl -sfL -m 30 -o "/tmp/merge-settings.js" https://raw.githubusercontent.com/node-red/linux-installers/master/resources/merge-settings.js 2>&1)
+                    CURL_EXIT=$?
+                    echo "$CURL_OUTPUT" | $SUDO tee -a /var/log/nodered-install.log >> /dev/null
+                    if [ $CURL_EXIT  -eq 0 ]; then
+                        echo " "
+                        echo "Just FYI : Your settings.js file is different from the latest defaults."
+                        read -t 20 -p "Would you like me to backup your existing settings.js and try to merge it with the new version ? (y/N) ? " yn
+                        case $yn in
+                            [Yy]* )
+                            node /tmp/merge-settings.js --diff "$file" "/usr/lib/node_modules/node-red/settings.js"
+                            ;;
+                            * )
+                            echo "You may wish to run"
+                            echo "   diff -y -w --suppress-common-lines /usr/lib/node_modules/node-red/settings.js $file"
+                            echo "to compare them and see what the latest options are."
+                            ;;
+                        esac
+                    else
+                        echo " "
+                        echo "Just FYI : Your settings.js file is different from the latest defaults."
+                        echo "You may wish to run"
+                        echo "   diff -y -w --suppress-common-lines /usr/lib/node_modules/node-red/settings.js $file"
+                        echo "to compare them and see what the latest options are."
+                    fi
+                    echo " "
+                fi
+
+                echo "**********************************************************************************"
+                echo " ### WARNING ###"
+                echo " DO NOT EXPOSE NODE-RED TO THE OPEN INTERNET WITHOUT SECURING IT FIRST"
+                echo " "
+                echo " Even if your Node-RED doesn't have anything valuable, (automated) attacks will"
+                echo " happen and could provide a foothold in your local network"
+                echo " "
+                echo " Follow the guide at https://nodered.org/docs/user-guide/runtime/securing-node-red"
+                echo " to setup security."
+                echo " "
+                echo " ### ADDITIONAL RECOMMENDATIONS ###"
+                if [ -f /etc/sudoers.d/010_pi-nopasswd ]; then
+                    echo "  - Remove the /etc/sudoers.d/010_pi-nopasswd file to require entering your password"
+                    echo "    when performing any sudo/root commands:"
+                    echo " "
+                    echo "      sudo rm -f /etc/sudoers.d/010_pi-nopasswd"
+                    echo " "
+                fi
+                if [ ! -f "$file" ]; then
+                    echo "  - You can customise the initial settings by running:"
+                    echo " "
+                    echo "      node-red admin init"
+                    echo " "
+                fi
+                if [ "$EUID" == "0" ]; then
+                    echo "  - Do not run Node-RED as root or an administrative account"
+                    echo " "
+                fi
+                echo "**********************************************************************************"
+                echo " "
+                if [ ! -f "$file" ]; then
+                    initset="${INITSET}"
+                    case $initset in
+                        [Yy]* )
+                        export HOSTIP=$(hostname -I | cut -d ' ' -f 1)  # FIX: replaced backtick with $()
+                        $SUDO chown -Rf "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.node-red" 2>&1 >>/dev/null
+                        $SUDOU /usr/bin/node-red admin init
+                        ;;
+                        [Nn]* )
+                        echo "Settings not initialized."
+                        exit 0
+                        ;;
+                        * )
+                        $SUDO chown -Rf "$NODERED_USER:$NODERED_GROUP" "$NODERED_HOME/.node-red/" 2>&1 >>/dev/null
+                        $SUDOU /usr/bin/node-red admin init
+                        ;;
+                    esac
+                fi
+            fi
+            exit 0
+        ;;
+        * )
+            echo " "
+            exit 1
+        ;;
+    esac
+else
+    echo " "
+    echo "Sorry - cannot connect to internet - not going to touch anything."
+    echo "https://www.npmjs.com/package/node-red   is not reachable."
+    echo "Please ensure you have a working internet connection."
+    echo "Return code from curl is "$?
+    echo " "
+    exit 1
+fi
