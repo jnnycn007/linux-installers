@@ -61,7 +61,7 @@ umask 0022
 
 usage() {
   cat << EOL
-Usage: $0 [options]
+Usage: install-update-nodered [options]
 
 Options:
   --help            display this help and exit
